@@ -5,19 +5,26 @@
 #include <sys/types.h>
 #include <string>
 #include <cstring>
+#include <sys/epoll.h>
+#include <cassert>
+#include <arpa/inet.h>
+#include <cstdlib>
+
+const int MAX_EVENTS = 10;
+const int PORT = 8080;
 
 void handleRequest(int clientSocket) {
-    char buffer[1024];
-    memset(buffer, 0, sizeof(buffer));
+    // char buffer[1024];
+    // memset(buffer, 0, sizeof(buffer));
 
-    if(read(clientSocket, buffer, sizeof(buffer) - 1) <= 0) {
-        std::cerr << "Error: Unable to read client request. " << std::endl;
-        return;
-    }
+    // if(read(clientSocket, buffer, sizeof(buffer) - 1) <= 0) {
+    //     std::cerr << "Error: Unable to read client request. " << std::endl;
+    //     return;
+    // }
 
-    std::cout << "Recv HTTP Request. " << std::endl;
+    // std::cout << "Recv HTTP Request. " << std::endl;
 
-    std::cout << "Contents of buffer: " << buffer << std::endl;
+    // std::cout << "Contents of buffer: " << buffer << std::endl;
 
     // 发送HTTP响应
     std::string response = "HTTP/1.1 200 OK\r\n"
@@ -37,9 +44,13 @@ int main()
 
     // 设置套接字的类型、IP和端口
     struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(8080);
+    serverAddr.sin_port = htons(PORT);
     serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    int flag = 1;
+    setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
 
     // 將套接字与特定的地址和端口进行绑定
     if(bind(serverSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
@@ -57,19 +68,67 @@ int main()
 
     std::cout << "Server is listening on port 8080... " << std::endl;
 
-    while(true) {
-        sockaddr_in clientAdd;
-        socklen_t clientAddLen = sizeof(clientAdd);
-        int clientSock = accept(serverSock, (struct sockaddr*)&clientAdd, &clientAddLen);
+    // 创建epoll实例
+    int epollfd = epoll_create(5);
+    assert(epollfd != -1);
 
-        if(clientSock == -1) {
-            std::cerr << "Error: Unable to accept client connection. " << std::endl;
-            continue;
+    // 添加监听套接字到epoll实例
+    struct epoll_event event;
+    event.events = EPOLLIN;
+    event.data.fd = serverSock;
+
+    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, serverSock, &event) == -1) {
+        std::cerr << "Epoll control failed" << std::endl;
+        return 1;
+    }
+
+    while(true) {
+        struct epoll_event events[MAX_EVENTS];
+        int numEvents = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+        if(numEvents == -1) {
+            std::cerr << "Epoll wait failed. " << std::endl;
+            return 1;
         }
 
-        handleRequest(clientSock);
+        for(int i = 0; i < numEvents; ++i) {
+            int currentFd = events[i].data.fd;
 
-        close(clientSock);
+            if(currentFd == serverSock) {
+                int clientSock = accept(serverSock, nullptr, nullptr);
+                if(clientSock == -1) {
+                    std::cerr << "Accept failed. " << std::endl;
+                    continue;
+                }
+
+                std::cout << "Accepted new connection. " << std::endl;
+
+                event.events = EPOLLIN || EPOLLET;
+                event.data.fd = clientSock;
+                if(epoll_ctl(epollfd, EPOLL_CTL_ADD, clientSock, &event) == -1) {
+                    std::cerr << "Epoll control failed. " << std::endl;
+                    return 1;
+                }
+            }
+
+            else {
+                char buffer[1024];
+                ssize_t byteRead = recv(currentFd, buffer, sizeof(buffer), 0);
+                if(byteRead <= 0) {
+                    if(byteRead == 0) {
+                        std::cout << "Connection closed by client. " << std::endl;
+                    } else {
+                        std::cerr << " Recv failed. " << std::endl;
+                    }
+
+                    close(currentFd);
+                    epoll_ctl(epollfd, EPOLL_CTL_DEL, currentFd, nullptr);
+                } else {
+                    handleRequest(currentFd);
+                    close(currentFd);
+                }
+            }
+        }
+
     }
 
     close(serverSock);
